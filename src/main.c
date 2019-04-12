@@ -30,8 +30,9 @@ int main(int argc, char *argv[]) {
     struct addrinfo *resolved, *iter;
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_socktype = SOCK_DGRAM;
     hints.ai_family = AF_UNSPEC;
+    hints.ai_flags = 0;
     int res = getaddrinfo(host, NULL, &hints, &resolved);
     if (res) {
         printf("getaddrinfo = %d\n", res);
