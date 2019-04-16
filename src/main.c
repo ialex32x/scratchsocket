@@ -6,6 +6,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <Windows.h>
+// https://docs.microsoft.com/en-us/windows/desktop/WinSock/windows-sockets-error-codes-2
+
+#include <process.h>
 
 int init() {
 	WSADATA wsaData;
@@ -24,6 +27,12 @@ void deinit() {
 	WSACleanup();
 }
 
+enum duk_sock_state {
+    DSOCK_CLOSED = 0,
+    DSOCK_CONNECTING = 1,
+    DSOCK_CONNECTED = 2,
+};
+
 #define BUF_SIZE 1024
 struct duk_sock_t {
 #if WIN32
@@ -31,6 +40,7 @@ struct duk_sock_t {
 #else
     int fd;
 #endif
+    enum duk_sock_state state;
     struct fd_set read_fds;
     struct fd_set write_fds;
     struct timeval timeout;
@@ -39,7 +49,7 @@ struct duk_sock_t {
 
 void duk_sock_setnonblocking(struct duk_sock_t *sock) {
 #if WIN32
-    u_long argp = 0;
+    u_long argp = 1;
     ioctlsocket(sock->fd, FIONBIO, &argp);
 #else 
     int flags = fcntl(sock->fd, F_GETFL, 0);
@@ -67,21 +77,42 @@ struct duk_sock_t *duk_sock_create(int af, int type, int protocol) {
 }
 
 int duk_sock_connect(struct duk_sock_t *sock, struct sockaddr *addr, int port) {
+    int res = -1;
     switch (addr->sa_family) {
         case AF_INET: {
             struct sockaddr_in sa;
             memcpy(&sa, addr, sizeof(struct sockaddr_in));
-            sa.sin_port = htons(port);   
-            return connect(sock->fd, (const struct sockaddr *)&sa, sizeof(struct sockaddr_in));
+            sa.sin_port = htons(port);
+            sock->state = DSOCK_CONNECTING;
+            res = connect(sock->fd, (const struct sockaddr *)&sa, sizeof(struct sockaddr_in));
+            break;
         }
         case AF_INET6: {
             struct sockaddr_in6 sa;
             memcpy(&sa, addr, sizeof(struct sockaddr_in6));
-            sa.sin6_port = htons(port);   
-            return connect(sock->fd, (const struct sockaddr *)&sa, sizeof(struct sockaddr_in6));
+            sa.sin6_port = htons(port);
+            sock->state = DSOCK_CONNECTING;
+            res = connect(sock->fd, (const struct sockaddr *)&sa, sizeof(struct sockaddr_in6));
+            break;
         }
         default: return -1;
     }
+    if (res < 0) {
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+            printf("connect failed %d (%d)\n", res, WSAGetLastError());
+            return -1;
+        }
+        res = 0;
+    }
+    // int optval;
+    // socklen_t optlen = sizeof(optval);
+    // res = getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, (char *)&optval, &optlen);
+    // if (res < 0) {
+    //     printf("getsockopt failed %d (%d)\n", res, WSAGetLastError());
+    //     return -1;
+    // }
+    return res;
 }
 
 int duk_sock_close(struct duk_sock_t *sock) {
@@ -90,6 +121,24 @@ int duk_sock_close(struct duk_sock_t *sock) {
 }
 
 int duk_sock_poll(struct duk_sock_t *sock) {
+    if (sock->state == DSOCK_CLOSED) {
+        return 0;
+    }
+    int res;
+
+    // if (sock->state == DSOCK_CONNECTING) {
+    //     int optval;
+    //     socklen_t optlen = sizeof(optval);
+    //     res = getsockopt(sock->fd, SOL_SOCKET, SO_ERROR, (char *)&optval, &optlen);
+    //     if (res < 0) {
+    //         printf("getsockopt failed %d (%d)\n", res, WSAGetLastError());
+    //         return -1;
+    //     }
+    //     printf("getsockopt: %d\n", optval);
+    //     sock->state = DSOCK_CONNECTED;
+    //     return 0;
+    // }
+
     FD_ZERO(&sock->read_fds);
     FD_ZERO(&sock->write_fds);
     FD_SET(sock->fd, &sock->read_fds);
@@ -99,23 +148,33 @@ int duk_sock_poll(struct duk_sock_t *sock) {
 #else 
     int maxfd = sock->fd + 1;
 #endif
-    int res = select(maxfd, &sock->read_fds, &sock->write_fds, NULL, &sock->timeout);
+    res = select(maxfd, &sock->read_fds, &sock->write_fds, NULL, &sock->timeout);
     if (res < 0) {
         // error
+        sock->state = DSOCK_CLOSED;
+        printf("select failed %d (%d)\n", res, WSAGetLastError());
         return -1;
     }
     if (res == 0) { 
         // timeout
         return 0;
     }
+
     if (FD_ISSET(sock->fd, &sock->read_fds)) {
         res = recv(sock->fd, sock->buf, BUF_SIZE, 0);
         if (res <= 0) {
-            printf("recv failed %d (%d)\n", res, WSAGetLastError());
-            return -1;
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) {
+                sock->state = DSOCK_CLOSED;
+                printf("recv failed %d (%d)\n", res, WSAGetLastError());
+                return -1;
+            }
+        } else {
+            sock->state = DSOCK_CONNECTED;
+            printf("echo %s\n", sock->buf + 4);
         }
-        printf("echo %s\n", sock->buf + 4);
     }
+
     if (FD_ISSET(sock->fd, &sock->write_fds)) {
         static int tick = 0;
         if (!(tick++ % 100)) {
@@ -128,18 +187,28 @@ int duk_sock_poll(struct duk_sock_t *sock) {
             memcpy(sendbuf, &hlen, 4);
             res = send(sock->fd, sendbuf, sendbuflen + 4, 0);
             if (res <= 0) {
-                printf("send failed %d (%d)\n", res, WSAGetLastError());
-                return -1;
+                int err = WSAGetLastError();
+                if (err != WSAEWOULDBLOCK) {
+                    sock->state = DSOCK_CLOSED;
+                    printf("send failed %d (%d)\n", res, WSAGetLastError());
+                    return -1;
+                }
             }
+            sock->state = DSOCK_CONNECTED;
         }
     }
     return 0;
 }
 
+// unsigned _thread_work(void *ctx) {
+//     return 0;
+// }
+
 int main(int argc, char *argv[]) {
     if (!init()) {
         return 0;
     }
+    // _beginthreadex(NULL, 0, _thread_work, NULL, CREATE_SUSPENDED, NULL);
 
     const char *host = argv[1];
     const char *serv = NULL;
@@ -180,16 +249,15 @@ int main(int argc, char *argv[]) {
     if (result) {
         // struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        duk_sock_setnonblocking(sock);
         res = duk_sock_connect(sock, result, 1234);
 
-        if (res < 0) {
-            printf("connect failed %d (%d)\n", res, WSAGetLastError());
-        } else {
-            duk_sock_setnonblocking(sock);
+        if (res >= 0) {
             while (1) {
                 res = duk_sock_poll(sock);
                 if (res < 0) {
                     // error
+                    printf("poll error");
                     break;
                 }
                 Sleep(10);
