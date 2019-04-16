@@ -63,7 +63,6 @@ struct duk_sock_t *duk_sock_create(int af, int type, int protocol) {
     struct duk_sock_t *sock = (struct duk_sock_t *)malloc(sizeof(struct duk_sock_t));
     memset(sock, 0, sizeof(struct duk_sock_t));
     sock->fd = fd;
-    duk_sock_setnonblocking(sock);
     return sock;
 }
 
@@ -115,7 +114,7 @@ int duk_sock_poll(struct duk_sock_t *sock) {
             printf("recv failed %d (%d)\n", res, WSAGetLastError());
             return -1;
         }
-        printf("echo %s\n", sock->buf);
+        printf("echo %s\n", sock->buf + 4);
     }
     if (FD_ISSET(sock->fd, &sock->write_fds)) {
         static int tick = 0;
@@ -123,9 +122,11 @@ int duk_sock_poll(struct duk_sock_t *sock) {
             static char sendbuf[1024];
             int sendbufcap = 1024;
             int sendbuflen = 0;
-            int sendcount = 0;
-            sendbuflen = sprintf(sendbuf, "message#%d", sendcount++);
-            res = send(sock->fd, sendbuf, sendbuflen, 0);
+            static int sendcount = 0;
+            sendbuflen = sprintf(sendbuf + 4, "message#%d", sendcount++);
+            int hlen = htonl(sendbuflen);
+            memcpy(sendbuf, &hlen, 4);
+            res = send(sock->fd, sendbuf, sendbuflen + 4, 0);
             if (res <= 0) {
                 printf("send failed %d (%d)\n", res, WSAGetLastError());
                 return -1;
@@ -177,23 +178,25 @@ int main(int argc, char *argv[]) {
     }
 
     if (result) {
-        struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        // struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         res = duk_sock_connect(sock, result, 1234);
 
         if (res < 0) {
             printf("connect failed %d (%d)\n", res, WSAGetLastError());
         } else {
+            duk_sock_setnonblocking(sock);
             while (1) {
                 res = duk_sock_poll(sock);
                 if (res < 0) {
                     // error
                     break;
                 }
+                Sleep(10);
                 if (res == 0) { 
                     // timeout
                     continue;
                 }
-                Sleep(10);
             }
         }
         duk_sock_close(sock);
