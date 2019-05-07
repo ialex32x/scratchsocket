@@ -10,6 +10,8 @@
 
 #include <process.h>
 
+#include "ikcp.h"
+
 int init() {
 	WSADATA wsaData;
     WORD wVersionRequested = MAKEWORD(2, 0);
@@ -45,6 +47,7 @@ struct duk_sock_t {
     struct fd_set write_fds;
     struct timeval timeout;
     char buf[BUF_SIZE];
+    ikcpcb *kcp;
 };
 
 void duk_sock_setnonblocking(struct duk_sock_t *sock) {
@@ -171,7 +174,21 @@ int duk_sock_poll(struct duk_sock_t *sock) {
             }
         } else {
             sock->state = DSOCK_CONNECTED;
-            printf("echo %s\n", sock->buf + 4);
+            if (sock->kcp) {
+                res = ikcp_input(sock->kcp, sock->buf, res);
+                if (res < 0) {
+                    sock->state = DSOCK_CLOSED;
+                    printf("kcp input failed %d\n", res);
+                    return -1;
+                }
+                res = ikcp_recv(sock->kcp, sock->buf, BUF_SIZE);
+                if (res > 0) {
+                    sock->buf[res] = 0;
+                    printf("echo %s\n", sock->buf);
+                }
+            } else {
+                printf("echo %s\n", sock->buf);
+            }
         }
     }
 
@@ -179,19 +196,25 @@ int duk_sock_poll(struct duk_sock_t *sock) {
         static int tick = 0;
         if (!(tick++ % 100)) {
             static char sendbuf[1024];
-            int sendbufcap = 1024;
             int sendbuflen = 0;
             static int sendcount = 0;
-            sendbuflen = sprintf(sendbuf + 4, "message#%d", sendcount++);
-            int hlen = htonl(sendbuflen);
-            memcpy(sendbuf, &hlen, 4);
-            res = send(sock->fd, sendbuf, sendbuflen + 4, 0);
-            if (res <= 0) {
-                int err = WSAGetLastError();
-                if (err != WSAEWOULDBLOCK) {
+            sendbuflen = sprintf(sendbuf, "message#%d", sendcount++);
+            if (sock->kcp) {
+                res = ikcp_send(sock->kcp, sendbuf, sendbuflen);
+                if (res < 0) {
                     sock->state = DSOCK_CLOSED;
-                    printf("send failed %d (%d)\n", res, WSAGetLastError());
+                    printf("kcp send failed %d\n", res);
                     return -1;
+                }
+            } else {
+                res = send(sock->fd, sendbuf, sendbuflen, 0);
+                if (res <= 0) {
+                    int err = WSAGetLastError();
+                    if (err != WSAEWOULDBLOCK) {
+                        sock->state = DSOCK_CLOSED;
+                        printf("send failed %d (%d)\n", res, WSAGetLastError());
+                        return -1;
+                    }
                 }
             }
             sock->state = DSOCK_CONNECTED;
@@ -203,6 +226,12 @@ int duk_sock_poll(struct duk_sock_t *sock) {
 // unsigned _thread_work(void *ctx) {
 //     return 0;
 // }
+
+int kcp_output(const char *buf, int len, struct IKCPCB *kcp, void *user) {
+    struct duk_sock_t *sock = (struct duk_sock_t *) user;
+    send(sock->fd, buf, len, 0);
+    return 0;
+}
 
 int main(int argc, char *argv[]) {
     if (!init()) {
@@ -247,13 +276,20 @@ int main(int argc, char *argv[]) {
     }
 
     if (result) {
-        // struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        printf("create socket\n");
+        struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        // struct duk_sock_t *sock = duk_sock_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sock->kcp = ikcp_create(0x11223344, (void*)sock);
+        sock->kcp->output = kcp_output;
+        ikcp_nodelay(sock->kcp, 1, 10, 0, 0);
+        ikcp_wndsize(sock->kcp, 512, 512);
         duk_sock_setnonblocking(sock);
         res = duk_sock_connect(sock, result, 1234);
 
+        IUINT32 ts = 0;
         if (res >= 0) {
             while (1) {
+                ikcp_update(sock->kcp, ts);
                 res = duk_sock_poll(sock);
                 if (res < 0) {
                     // error
@@ -261,12 +297,15 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 Sleep(10);
+                ts += 10;
                 if (res == 0) { 
                     // timeout
                     continue;
                 }
             }
         }
+        ikcp_release(sock->kcp);
+        sock->kcp = 0;
         duk_sock_close(sock);
     }
     freeaddrinfo(resolved);
