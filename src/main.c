@@ -36,6 +36,7 @@ enum duk_sock_state {
 };
 
 #define BUF_SIZE 1024
+
 struct duk_sock_t {
 #if WIN32
     SOCKET fd;
@@ -49,6 +50,13 @@ struct duk_sock_t {
     char buf[BUF_SIZE];
     ikcpcb *kcp;
 };
+
+/*
+struct duk_kcp_t {
+    struct duk_sock_t *sock;
+    ikcpcb *kcp;
+};
+*/
 
 void duk_sock_setnonblocking(struct duk_sock_t *sock) {
 #if WIN32
