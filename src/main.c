@@ -241,7 +241,216 @@ int kcp_output(const char *buf, int len, struct IKCPCB *kcp, void *user) {
     return 0;
 }
 
+#include <stdint.h>
+typedef int32_t fix16_t;
+
+static const fix16_t FOUR_DIV_PI  = 0x145F3;            /*!< Fix16 value of 4/PI */
+static const fix16_t _FOUR_DIV_PI2 = 0xFFFF9840;        /*!< Fix16 value of -4/PI² */
+static const fix16_t X4_CORRECTION_COMPONENT = 0x399A; 	/*!< Fix16 value of 0.225 */
+static const fix16_t PI_DIV_4 = 0x0000C90F;             /*!< Fix16 value of PI/4 */
+static const fix16_t THREE_PI_DIV_4 = 0x00025B2F;       /*!< Fix16 value of 3PI/4 */
+
+static const fix16_t fix16_maximum  = 0x7FFFFFFF; /*!< the maximum value of fix16_t */
+static const fix16_t fix16_minimum  = 0x80000000; /*!< the minimum value of fix16_t */
+static const fix16_t fix16_overflow = 0x80000000; /*!< the value used to indicate overflows when FIXMATH_NO_OVERFLOW is not specified */
+
+static const fix16_t fix16_pi  = 205887;     /*!< fix16_t value of pi */
+static const fix16_t fix16_e   = 178145;     /*!< fix16_t value of e */
+static const fix16_t fix16_one = 0x00010000; /*!< fix16_t value of 1 */
+
+fix16_t fix16_mul(fix16_t inArg0, fix16_t inArg1) {
+	// Each argument is divided to 16-bit parts.
+	//					AB
+	//			*	 CD
+	// -----------
+	//					BD	16 * 16 -> 32 bit products
+	//				 CB
+	//				 AD
+	//				AC
+	//			 |----| 64 bit product
+	int32_t A = (inArg0 >> 16), C = (inArg1 >> 16);
+	uint32_t B = (inArg0 & 0xFFFF), D = (inArg1 & 0xFFFF);
+	
+	int32_t AC = A*C;
+	int32_t AD_CB = A*D + C*B;
+	uint32_t BD = B*D;
+	
+	int32_t product_hi = AC + (AD_CB >> 16);
+	
+	// Handle carry from lower 32 bits to upper part of result.
+	uint32_t ad_cb_temp = AD_CB << 16;
+	uint32_t product_lo = BD + ad_cb_temp;
+	if (product_lo < BD)
+		product_hi++;
+	
+	// The upper 17 bits should all be the same (the sign).
+	if (product_hi >> 31 != product_hi >> 15)
+		return fix16_overflow;
+	
+#ifdef FIXMATH_NO_ROUNDING
+	return (product_hi << 16) | (product_lo >> 16);
+#else
+	// Subtracting 0x8000 (= 0.5) and then using signed right shift
+	// achieves proper rounding to result-1, except in the corner
+	// case of negative numbers and lowest word = 0x8000.
+	// To handle that, we also have to subtract 1 for negative numbers.
+	uint32_t product_lo_tmp = product_lo;
+	product_lo -= 0x8000;
+	product_lo -= (uint32_t)product_hi >> 31;
+	if (product_lo > product_lo_tmp)
+		product_hi--;
+	
+	// Discard the lowest 16 bits. Note that this is not exactly the same
+	// as dividing by 0x10000. For example if product = -1, result will
+	// also be -1 and not 0. This is compensated by adding +1 to the result
+	
+    // and compensating this in turn in the rounding above.
+	fix16_t result = (product_hi << 16) | (product_lo >> 16);
+	result += 1;
+	return result;
+#endif
+}
+
+static inline fix16_t fix16_from_float(double a)
+{
+	double temp = a * fix16_one;
+#ifndef FIXMATH_NO_ROUNDING
+	temp += (temp >= 0) ? 0.5f : -0.5f;
+#endif
+	return (fix16_t)temp;
+}
+fix16_t fix16_div(fix16_t a, fix16_t b)
+{
+	// This uses the basic binary restoring division algorithm.
+	// It appears to be faster to do the whole division manually than
+	// trying to compose a 64-bit divide out of 32-bit divisions on
+	// platforms without hardware divide.
+	
+	if (b == 0)
+		return fix16_minimum;
+	
+	uint32_t remainder = (a >= 0) ? a : (-a);
+	uint32_t divider = (b >= 0) ? b : (-b);
+
+	uint32_t quotient = 0;
+	uint32_t bit = 0x10000;
+	
+	/* The algorithm requires D >= R */
+	while (divider < remainder)
+	{
+		divider <<= 1;
+		bit <<= 1;
+	}
+	
+	if (!bit)
+		return fix16_overflow;
+	
+	if (divider & 0x80000000)
+	{
+		// Perform one step manually to avoid overflows later.
+		// We know that divider's bottom bit is 0 here.
+		if (remainder >= divider)
+		{
+				quotient |= bit;
+				remainder -= divider;
+		}
+		divider >>= 1;
+		bit >>= 1;
+	}
+	
+	/* Main division loop */
+	while (bit && remainder)
+	{
+		if (remainder >= divider)
+		{
+				quotient |= bit;
+				remainder -= divider;
+		}
+		
+		remainder <<= 1;
+		bit >>= 1;
+	}	 
+			
+	if (remainder >= divider)
+	{
+		quotient++;
+	}
+	
+	fix16_t result = quotient;
+	
+	/* Figure out the sign of result */
+	if ((a ^ b) & 0x80000000)
+	{
+		if (result == fix16_minimum)
+				return fix16_overflow;
+		
+		result = -result;
+	}
+	
+	return result;
+}
+static inline float   fix16_to_float(fix16_t a) { return (float)a / fix16_one; }
+
+fix16_t fix16_sin(fix16_t inAngle)
+{
+	fix16_t tempAngle = inAngle % (fix16_pi << 1);
+
+	if(tempAngle > fix16_pi)
+		tempAngle -= (fix16_pi << 1);
+	else if(tempAngle < -fix16_pi)
+		tempAngle += (fix16_pi << 1);
+    fix16_t tempOut;
+	fix16_t tempAngleSq = fix16_mul(tempAngle, tempAngle);
+	tempOut = fix16_mul(-13, tempAngleSq) + 546;
+	tempOut = fix16_mul(tempOut, tempAngleSq) - 10923;
+	tempOut = fix16_mul(tempOut, tempAngleSq) + 65536;
+	tempOut = fix16_mul(tempOut, tempAngle);
+    
+	return tempOut;
+}
+
+fix16_t fix16_atan2(fix16_t inY , fix16_t inX)
+{
+	fix16_t abs_inY, mask, angle, r, r_3;
+
+	/* Absolute inY */
+	mask = (inY >> (sizeof(fix16_t)*CHAR_BIT-1));
+	abs_inY = (inY + mask) ^ mask;
+
+	if (inX >= 0)
+	{
+		r = fix16_div( (inX - abs_inY), (inX + abs_inY));
+		r_3 = fix16_mul(fix16_mul(r, r),r);
+		angle = fix16_mul(0x00003240 , r_3) - fix16_mul(0x0000FB50,r) + PI_DIV_4;
+	} else {
+		r = fix16_div( (inX + abs_inY), (abs_inY - inX));
+		r_3 = fix16_mul(fix16_mul(r, r),r);
+		angle = fix16_mul(0x00003240 , r_3)
+			- fix16_mul(0x0000FB50,r)
+			+ THREE_PI_DIV_4;
+	}
+	if (inY < 0)
+	{
+		angle = -angle;
+	}
+
+	return angle;
+}
+
+fix16_t fix16_atan(fix16_t x)
+{
+	return fix16_atan2(x, fix16_one);
+}
+
 int main(int argc, char *argv[]) {
+    fix16_t a = fix16_from_float(-5.1);
+    fix16_t c = fix16_atan(a);
+    float fc = fix16_to_float(c);
+    printf("c = %d (%f)\n", c, fc);
+    return 0;
+}
+
+int d_main(int argc, char *argv[]) {
     if (!init()) {
         return 0;
     }
